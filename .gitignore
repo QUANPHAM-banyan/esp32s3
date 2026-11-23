@@ -1,0 +1,6 @@
+disassembled.asm
+build/
+.pio/
+*.bin
+*.elf
+*.map
