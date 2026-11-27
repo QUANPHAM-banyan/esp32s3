@@ -15,7 +15,7 @@ def load_rfid_cards():
                 return json.load(f)
         except Exception:
             pass
-    return ["A1 B2 C3 D4"]
+    return []
 
 def save_rfid_cards(cards):
     try:
@@ -30,6 +30,9 @@ device_state = {
     "pir": False,
     "gas": False,
     "door_sensor": False,
+    "door_unlocked": False,
+    "fan": False,
+    "lamp": False,
     "temp": 0.0,
     "hum": 0.0,
     "uptime": 0,
@@ -42,8 +45,11 @@ device_commands = {
     "lamp": 0,
     "door": 0,
     "buzzer": 0,
-    "rfid_enroll": 0
+    "rfid_enroll": 0,
+    "rfid_scan": 0
 }
+rfid_pending_name = None
+rfid_scan_result = None
 
 latest_jpeg_frame = None
 latest_frame_time = 0
@@ -69,6 +75,16 @@ def device_status():
     device_state["pir"] = bool(data.get("pir", False))
     device_state["gas"] = bool(data.get("gas", False))
     device_state["door_sensor"] = bool(data.get("door_sensor", False))
+
+    door_now = bool(data.get("door", False))
+    if device_state.get("door_unlocked") and not door_now:
+        add_log("ESP32: DOOR LOCKED (RELAY 2 OFF)")
+    elif not device_state.get("door_unlocked") and door_now:
+        add_log("ESP32: DOOR UNLOCKED (RELAY 2 ON)")
+
+    device_state["door_unlocked"] = door_now
+    device_state["fan"] = bool(data.get("fan", False))
+    device_state["lamp"] = bool(data.get("lamp", False))
     device_state["temp"] = float(data.get("temp", 0.0))
     device_state["hum"] = float(data.get("hum", 0.0))
     device_state["uptime"] = int(data.get("uptime", 0))
@@ -78,7 +94,9 @@ def device_status():
 
 @app.route('/api/device/command', methods=['GET'])
 def device_command():
-    return jsonify(device_commands)
+    snapshot = dict(device_commands)
+    device_commands["door"] = 0   # Reset lệnh mở cửa sau khi gửi cho ESP để tránh kích hoạt lại
+    return jsonify(snapshot)
 
 @app.route('/api/device/camera/upload', methods=['POST'])
 def camera_upload():
@@ -91,7 +109,9 @@ def camera_upload():
 def rfid_check():
     data = request.get_json(silent=True) or {}
     uid = data.get("uid", "").strip().upper()
-    authorized = uid in [c.upper() for c in rfid_whitelist]
+    authorized = uid in [c.get("uid", "").upper() for c in rfid_whitelist if isinstance(c, dict)]
+    if not authorized:  # chuyển tiếp dữ liệu cũ chỉ gồm UID
+        authorized = uid in [c.upper() for c in rfid_whitelist if isinstance(c, str)]
     if authorized:
         add_log(f"ACCESS GRANTED - UID: {uid}")
         device_commands["door"] = 1
@@ -103,12 +123,33 @@ def rfid_check():
 def rfid_enroll():
     data = request.get_json(silent=True) or {}
     uid = data.get("uid", "").strip().upper()
-    if uid and uid not in [c.upper() for c in rfid_whitelist]:
-        rfid_whitelist.append(uid)
-        save_rfid_cards(rfid_whitelist)
-        add_log(f"NEW RFID ENROLLED: {uid}")
-        return jsonify({"status": "OK", "enrolled": uid})
-    return jsonify({"status": "EXISTS_OR_INVALID"})
+    global rfid_scan_result
+    rfid_scan_result = {"uid": uid, "name": rfid_pending_name}
+    return jsonify({"status": "RECEIVED"})
+
+@app.route('/api/web/rfid/scan', methods=['POST'])
+def web_rfid_scan():
+    global rfid_pending_name, rfid_scan_result
+    name = (request.get_json(silent=True) or {}).get("name", "").strip()
+    if not name: return jsonify({"status":"INVALID_NAME"}), 400
+    rfid_pending_name, rfid_scan_result = name, None
+    device_commands["rfid_scan"] = 1
+    return jsonify({"status":"OK"})
+
+@app.route('/api/web/rfid/result', methods=['GET'])
+def web_rfid_result():
+    return jsonify(rfid_scan_result or {"status":"WAITING"})
+
+@app.route('/api/web/rfid/confirm', methods=['POST'])
+def web_rfid_confirm():
+    global rfid_pending_name, rfid_scan_result
+    data=request.get_json(silent=True) or {}; uid=data.get("uid","").strip().upper(); save=bool(data.get("save"))
+    if save and uid and rfid_pending_name:
+        if any((c.get("uid","") if isinstance(c,dict) else c).upper()==uid for c in rfid_whitelist):
+            return jsonify({"status":"EXISTS"})
+        rfid_whitelist.append({"uid":uid,"name":rfid_pending_name}); save_rfid_cards(rfid_whitelist); add_log(f"RFID ADDED: {rfid_pending_name} ({uid})")
+    rfid_pending_name=None; rfid_scan_result=None
+    return jsonify({"status":"OK"})
 
 # =========================================================================
 # API DÀNH CHO WEB DASHBOARD
@@ -121,7 +162,7 @@ def web_state():
     return jsonify({
         "device": device_state,
         "commands": device_commands,
-        "rfid_cards": rfid_whitelist,
+        "rfid_cards": [({"uid":c,"name":""} if isinstance(c,str) else c) for c in rfid_whitelist],
         "logs": event_logs[:20],
         "has_camera": (latest_jpeg_frame is not None and (time.time() - latest_frame_time) < 15),
         "frame_age": round(time.time() - latest_frame_time, 1) if latest_frame_time > 0 else -1
@@ -152,7 +193,7 @@ def web_rfid_add():
 def web_rfid_delete():
     data = request.get_json(silent=True) or {}
     uid = data.get("uid", "").strip().upper()
-    cards_upper = [c.upper() for c in rfid_whitelist]
+    cards_upper = [(c.get("uid","") if isinstance(c,dict) else c).upper() for c in rfid_whitelist]
     if uid in cards_upper:
         idx = cards_upper.index(uid)
         removed = rfid_whitelist.pop(idx)
@@ -174,7 +215,12 @@ def generate_mjpeg_stream():
 
 @app.route('/stream')
 def video_stream():
-    return Response(generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    resp = Response(generate_mjpeg_stream(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    resp.headers['X-Accel-Buffering'] = 'no'
+    return resp
 
 @app.route('/snapshot')
 def video_snapshot():
@@ -498,9 +544,9 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <span id="cam-info">Chờ tín hiệu</span>
                     </div>
                     <div class="camera-container">
-                        <img id="stream-img" class="camera-stream" src="/stream" alt="" onerror="handleImgError()" onload="handleImgLoad()">
-                        <div id="cam-placeholder" class="camera-placeholder" style="display: none;">Chưa có luồng video</div>
-                        <div id="cam-age" class="camera-overlay">Đang nhận luồng</div>
+                        <img id="stream-img" class="camera-stream" alt="" onerror="handleImgError()" onload="handleImgLoad()" style="display: none;">
+                        <div id="cam-placeholder" class="camera-placeholder">Chưa có luồng video</div>
+                        <div id="cam-age" class="camera-overlay">Chờ tín hiệu</div>
                     </div>
                 </div>
 
@@ -557,20 +603,20 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <span>Điều khiển thiết bị</span>
                     </div>
                     <div class="controls-grid">
+                        <button id="btn-lamp" class="btn" onclick="toggleActuator('lamp')">
+                            <span>Đèn (Relay 1 - LE1)</span>
+                            <span id="txt-lamp">[Tắt]</span>
+                        </button>
                         <button id="btn-door" class="btn" onclick="triggerDoor()">
-                            <span>Khóa cửa</span>
+                            <span>Cửa (Relay 2 - LE2)</span>
                             <span id="txt-door">[Đang khóa]</span>
                         </button>
                         <button id="btn-fan" class="btn" onclick="toggleActuator('fan')">
-                            <span>Quạt</span>
+                            <span>Quạt (Relay 3 - LE3)</span>
                             <span id="txt-fan">[Tắt]</span>
                         </button>
-                        <button id="btn-lamp" class="btn" onclick="toggleActuator('lamp')">
-                            <span>Đèn</span>
-                            <span id="txt-lamp">[Tắt]</span>
-                        </button>
                         <button id="btn-buzzer" class="btn" onclick="toggleActuator('buzzer')">
-                            <span>Còi</span>
+                            <span>Còi (Buzzer & LED)</span>
                             <span id="txt-buzzer">[Tắt]</span>
                         </button>
                     </div>
@@ -583,9 +629,8 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <span id="rfid-count">0 thẻ</span>
                     </div>
                     <div class="rfid-input-group">
-                        <input id="input-uid" type="text" class="text-input" placeholder="Nhập mã UID thẻ">
+                        <input id="input-uid" type="text" class="text-input" placeholder="Nhập tên người dùng">
                         <button class="btn-action" onclick="addRfidCard()">Thêm</button>
-                        <button id="btn-enroll" class="btn-action" onclick="toggleEnroll()">Ghi thẻ [Tắt]</button>
                     </div>
                     <ul id="rfid-list" class="rfid-list">
                         <li class="rfid-item"><span>Đang tải...</span></li>
@@ -649,25 +694,31 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             updateTag('val-door-sensor', dev.door_sensor, 'Mở', 'Đóng');
 
             // Controls
-            updateBtn('btn-door', 'txt-door', currentCommands.door, '[Mở 30s]', '[Đang khóa]');
+            currentDevState = dev;
+            if (doorRemaining <= 0) {
+                updateDoorUI();
+            }
             updateBtn('btn-fan', 'txt-fan', currentCommands.fan, '[Bật]', '[Tắt]');
             updateBtn('btn-lamp', 'txt-lamp', currentCommands.lamp, '[Bật]', '[Tắt]');
             updateBtn('btn-buzzer', 'txt-buzzer', currentCommands.buzzer, '[Bật]', '[Tắt]');
             
-            const btnEnroll = document.getElementById('btn-enroll');
-            if (currentCommands.rfid_enroll) {
-                btnEnroll.innerText = 'Ghi thẻ [Bật]';
-                btnEnroll.className = 'btn-action active';
-            } else {
-                btnEnroll.innerText = 'Ghi thẻ [Tắt]';
-                btnEnroll.className = 'btn-action';
-            }
 
-            // Camera age
+            // Camera age & dynamic stream attach
+            const img = document.getElementById('stream-img');
+            const placeholder = document.getElementById('cam-placeholder');
             if (data.has_camera) {
                 document.getElementById('cam-age').innerText = 'Độ trễ: ' + data.frame_age + 's';
+                if (!img.dataset.live) {
+                    img.dataset.live = '1';
+                    img.src = '/stream?t=' + Date.now();
+                }
             } else {
                 document.getElementById('cam-age').innerText = 'Chờ khung hình';
+                delete img.dataset.live;
+                img.removeAttribute('src');
+                img.style.display = 'none';
+                placeholder.style.display = 'block';
+                document.getElementById('cam-info').innerText = 'Chờ tín hiệu';
             }
 
             // RFID List
@@ -723,26 +774,74 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             postCommand({ [name]: current ? 0 : 1 });
         }
 
+        let doorTimer = null;
+        let doorRemaining = 0;
+        let currentDevState = null;
+
         function triggerDoor() {
+            if (doorRemaining > 0) {
+                // Nếu đang mở mà người dùng bấm lần nữa -> Khóa ngay lập tức
+                if (doorTimer) clearInterval(doorTimer);
+                doorTimer = null;
+                doorRemaining = 0;
+                postCommand({ door: 0 });
+                updateDoorUI();
+                return;
+            }
             postCommand({ door: 1 });
+            doorRemaining = 20;
+            updateDoorUI();
+            if (doorTimer) clearInterval(doorTimer);
+            doorTimer = setInterval(() => {
+                doorRemaining--;
+                if (doorRemaining <= 0) {
+                    clearInterval(doorTimer);
+                    doorTimer = null;
+                    postCommand({ door: 0 }); // Tự động phát lệnh khóa sau đúng 20s
+                }
+                updateDoorUI();
+            }, 1000);
         }
 
-        function toggleEnroll() {
-            const current = currentCommands.rfid_enroll || 0;
-            postCommand({ rfid_enroll: current ? 0 : 1 });
+        function updateDoorUI() {
+            const btn = document.getElementById('btn-door');
+            const txt = document.getElementById('txt-door');
+            const isUnlocked = (doorRemaining > 0) || (currentDevState && currentDevState.door_unlocked);
+            if (isUnlocked) {
+                btn.className = 'btn active';
+                txt.innerText = doorRemaining > 0 ? `[Mở: ${doorRemaining}s]` : '[Đang mở]';
+            } else {
+                btn.className = 'btn';
+                txt.innerText = '[Đang khóa]';
+            }
         }
 
         async function addRfidCard() {
             const input = document.getElementById('input-uid');
-            const uid = input.value.trim().toUpperCase();
-            if (!uid) return;
-            const res = await fetch('/api/web/rfid/add', {
+            const name = input.value.trim();
+            if (!name) return alert('Vui lòng nhập tên.');
+            input.value = '';
+            await fetch('/api/web/rfid/scan', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ uid: uid })
+                body: JSON.stringify({ name })
             });
-            input.value = '';
-            fetchSystemState();
+            const poll = async () => {
+                const result = await (await fetch('/api/web/rfid/result')).json();
+                if (!result.uid) return setTimeout(poll, 700);
+                const cards = (await (await fetch('/api/web/state')).json()).rfid_cards;
+                const exists = cards.some(c => (typeof c === 'string' ? c : c.uid).toUpperCase() === result.uid.toUpperCase());
+                if (exists) {
+                    const again = confirm('Thẻ đã tồn tại. OK để quét lại, Cancel để kết thúc.');
+                    await fetch('/api/web/rfid/confirm', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid:result.uid,save:false})});
+                    if (again) { await fetch('/api/web/rfid/scan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})}); return poll(); }
+                    return;
+                }
+                const save = confirm(`Lưu tên “${name}” cho thẻ ${result.uid}?`);
+                await fetch('/api/web/rfid/confirm', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({uid:result.uid,save})});
+                fetchSystemState();
+            };
+            poll();
         }
 
         async function deleteRfidCard(uid) {

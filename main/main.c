@@ -24,6 +24,7 @@
 #include "esp_camera.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
@@ -32,26 +33,26 @@
 static const char *TAG = "home_cam";
 
 // =========================================================================
-// ĐỊNH NGHĨA CHÂN GPIO (HARDWARE PIN MAP)
+// ĐỊNH NGHĨA CHÂN GPIO (HARDWARE PIN MAP - THEO SƠ ĐỒ THỰC TẾ)
 // =========================================================================
 // 1. Chân điều khiển Relay Output & Còi (Outputs)
-#define PIN_DOOR        20  // GPIO 20: Relay chốt khóa cửa điện từ
-#define PIN_FAN         21  // GPIO 21: Relay quạt thông gió
-#define PIN_LAMP        47  // GPIO 47: Relay đèn chiếu sáng
-#define PIN_BUZZER      48  // GPIO 48: Còi báo động (gas, an ninh)
+#define PIN_DOOR        21  // GPIO 21: RELAY2 (cửa) - Thay thế GPIO 21 (Chân 27 của U1)
+#define PIN_FAN         20  // GPIO 20: RELAY3 (quạt)
+#define PIN_LAMP        47  // GPIO 47: RELAY1 (đèn)
+#define PIN_BUZZER      48  // GPIO 48: Còi + LED tích hợp ESP32-S3-CAM
 
 // 2. Chân cảm biến đầu vào (Inputs)
-#define PIN_PIR         1   // GPIO 1: Cảm biến chuyển động PIR
-#define PIN_GAS         2   // GPIO 2: Cảm biến khí gas / khói MQ-2 (mức LOW khi phát hiện)
-#define PIN_RAIN        3   // GPIO 3: Cảm biến mưa / cảm biến từ cửa
-#define PIN_DHT         14  // GPIO 14: Cảm biến nhiệt độ & độ ẩm DHT11 / DHT22
+#define PIN_PIR         14  // GPIO 14: PIR (Digital - Cảm biến chuyển động)
+#define PIN_GAS         2   // GPIO 2:  Cảm biến khí gas (Digital - ngõ ra DO)
+#define PIN_RAIN        1   // GPIO 1:  Cảm biến mưa (Digital)
+#define PIN_DHT         19  // GPIO 19: Cảm biến nhiệt độ & độ ẩm DHT
 
 // 3. Chân giao tiếp SPI với Module RFID RC522
-#define PIN_RFID_MISO   39  // GPIO 39
-#define PIN_RFID_MOSI   40  // GPIO 40
-#define PIN_RFID_SCLK   41  // GPIO 41
-#define PIN_RFID_CS     42  // GPIO 42 (Chip Select)
-#define PIN_RFID_RST    38  // GPIO 38 (Reset cứng)
+#define PIN_RFID_MISO   39  // GPIO 39: MISO
+#define PIN_RFID_MOSI   40  // GPIO 40: MOSI
+#define PIN_RFID_SCLK   41  // GPIO 41: SCK
+#define PIN_RFID_CS     42  // GPIO 42: SDA (CS - Chip Select)
+#define PIN_RFID_RST    38  // GPIO 38: RST-rfid (Reset cứng)
 
 // =========================================================================
 // BIẾN TOÀN CỤC & ĐỒNG BỘ TRẠNG THÁI
@@ -137,15 +138,27 @@ static void apply_relay_outputs(void)
 
 static void init_pins(void)
 {
-    // Cấu hình các chân Output (Relay & Buzzer)
+    // Reset các chân output về trạng thái sạch (ngắt mọi chức năng RTC/ADC phụ)
+    gpio_reset_pin(PIN_DOOR);
+    gpio_reset_pin(PIN_FAN);
+    gpio_reset_pin(PIN_LAMP);
+    gpio_reset_pin(PIN_BUZZER);
+
+    // Cấu hình các chân Output (Relay & Buzzer) chế độ Push-Pull thuần túy
     gpio_config_t outputs = {
         .pin_bit_mask = (1ULL << PIN_DOOR) | (1ULL << PIN_FAN) | (1ULL << PIN_LAMP) | (1ULL << PIN_BUZZER),
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&outputs));
+
+    // Nâng khả năng phát dòng lên mức tối đa (GPIO_DRIVE_CAP_3 ~40mA) để không bị sụt áp
+    gpio_set_drive_capability(PIN_DOOR, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PIN_FAN, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PIN_LAMP, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(PIN_BUZZER, GPIO_DRIVE_CAP_3);
 
     // Cấu hình các chân Input (PIR, Gas, Rain, DHT)
     gpio_config_t inputs = {
@@ -157,13 +170,13 @@ static void init_pins(void)
     };
     ESP_ERROR_CHECK(gpio_config(&inputs));
 
-    // Đặt mức logic ban đầu: tắt toàn bộ thiết bị
+    // Đặt mức logic ban đầu: tắt toàn bộ thiết bị (mức 0V)
     set_pin_state(PIN_BUZZER, 0); // GPIO 48
-    set_pin_state(PIN_DOOR, 0);   // GPIO 20
-    set_pin_state(PIN_FAN, 0);    // GPIO 21
-    set_pin_state(PIN_LAMP, 0);   // GPIO 47
+    set_pin_state(PIN_DOOR, 0);   // GPIO 21 (RELAY2)
+    set_pin_state(PIN_FAN, 0);    // GPIO 20 (RELAY3)
+    set_pin_state(PIN_LAMP, 0);   // GPIO 47 (RELAY1)
 
-    ESP_LOGI(TAG, "GPIO initialized successfully");
+    ESP_LOGI(TAG, "GPIO initialized successfully (Max drive strength 40mA enabled)");
 }
 
 // =========================================================================
@@ -411,6 +424,9 @@ static void init_rfid(void)
 // =========================================================================
 static void init_camera(void)
 {
+    bool has_psram = (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0);
+    ESP_LOGI(TAG, "Initializing camera (PSRAM detected: %s)...", has_psram ? "YES" : "NO");
+
     camera_config_t config = {
         .pin_pwdn = -1,
         .pin_reset = -1,
@@ -432,29 +448,33 @@ static void init_camera(void)
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_VGA,
-        .jpeg_quality = 15,
-        .fb_count = 1,
-        .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+        .frame_size = FRAMESIZE_QVGA,
+        .jpeg_quality = 12,
+        .fb_count = has_psram ? 2 : 1,
+        .fb_location = has_psram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM,
+        .grab_mode = has_psram ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY,
     };
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK && config.fb_location == CAMERA_FB_IN_PSRAM) {
-        ESP_LOGW(TAG, "PSRAM fb allocation failed (0x%x), retrying in internal DRAM...", err);
+        ESP_LOGW(TAG, "PSRAM fb allocation failed (0x%x), retrying in internal DRAM with fb_count=1...", err);
         config.fb_location = CAMERA_FB_IN_DRAM;
+        config.fb_count = 1;
+        config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
         err = esp_camera_init(&config);
     }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
+        ESP_LOGE(TAG, "Camera init failed with error 0x%x (%s)", err, esp_err_to_name(err));
         return;
     }
 
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
         s->set_vflip(s, 0);
+        ESP_LOGI(TAG, "OV2640 camera ready (PID: 0x%x)", s->id.PID);
+    } else {
+        ESP_LOGI(TAG, "OV2640 camera ready");
     }
-    ESP_LOGI(TAG, "OV2640 camera ready");
 }
 
 // =========================================================================
@@ -490,8 +510,8 @@ static void init_wifi(void)
 
     wifi_config_t wifi_config = {
         .sta = {
-            .ssid = "Pham Minh Giang",
-            .password = "phamminhgiang",
+            .ssid = "AIThings",
+            .password = "12345678",
             .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
@@ -548,12 +568,12 @@ static void control_task(void *pvParameters)
     while (true) {
         read_sensors();
 
-        // 1. Tự động khóa cửa sau 30 giây kể từ lúc mở
+        // 1. Tự động khóa cửa sau thời gian mở (20 giây)
         if (g_door_unlock_until > 0 && esp_timer_get_time() >= g_door_unlock_until) {
             g_door_unlocked = false;
             g_door_unlock_until = 0;
             apply_relay_outputs();
-            ESP_LOGI(TAG, "Door locked automatically");
+            ESP_LOGI(TAG, "Door locked automatically after timeout");
         }
 
         // 2. Cảnh báo rò rỉ khí gas: kích hoạt quạt và còi hú
@@ -716,9 +736,9 @@ static void rfid_task(void *pvParameters)
             } else {
                 if (is_rfid_uid_authorized(current_uid)) {
                     g_door_unlocked = true;
-                    g_door_unlock_until = esp_timer_get_time() + 30000000ULL; // Mở 30 giây
+                    g_door_unlock_until = esp_timer_get_time() + 20000000ULL; // Mở 20 giây khi quẹt thẻ
                     apply_relay_outputs();
-                    ESP_LOGI(TAG, "Door unlocked for 30s");
+                    ESP_LOGI(TAG, "Door unlocked for 20s via RFID");
                 }
                 empty_scans = 0;
             }
@@ -804,24 +824,33 @@ static void server_sync_task(void *pvParameters)
     char post_data[512];
     char url[192];
     char resp_buf[260];
+    char status_resp[260];
 
     while (true) {
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
         // 1. Gửi POST JSON trạng thái cảm biến lên <g_server_url>/api/device/status
         int json_len = snprintf(post_data, sizeof(post_data),
-            "{\"device_id\":\"%s\",\"pir\":%s,\"gas\":%s,\"door_sensor\":%s,\"temp\":%.1f,\"hum\":%.1f,\"uptime\":%lld}",
+            "{\"device_id\":\"%s\",\"pir\":%s,\"gas\":%s,\"door_sensor\":%s,\"door\":%s,\"fan\":%s,\"lamp\":%s,\"temp\":%.1f,\"hum\":%.1f,\"uptime\":%lld}",
             "esp32s3cam",
             g_pir_detected ? "true" : "false",
             g_gas_detected ? "true" : "false",
             g_sensor_3     ? "true" : "false",
+            g_door_unlocked ? "true" : "false",
+            g_fan_on       ? "true" : "false",
+            g_lamp_on      ? "true" : "false",
             g_temperature, g_humidity, (long long)(esp_timer_get_time() / 1000));
 
         snprintf(url, sizeof(url), "%s/api/device/status", g_server_url);
+        memset(status_resp, 0, sizeof(status_resp));
+        resp_len = 0;
+
         esp_http_client_config_t post_cfg = {
             .url = url,
             .method = HTTP_METHOD_POST,
-            .timeout_ms = 3000,
+            .timeout_ms = 4000,
+            .event_handler = http_event_handler,
+            .user_data = status_resp,
             .crt_bundle_attach = esp_crt_bundle_attach,
         };
         esp_http_client_handle_t client = esp_http_client_init(&post_cfg);
@@ -829,8 +858,13 @@ static void server_sync_task(void *pvParameters)
             esp_http_client_set_header(client, "Content-Type", "application/json");
             esp_http_client_set_post_field(client, post_data, json_len);
             esp_err_t err = esp_http_client_perform(client);
+            int status = esp_http_client_get_status_code(client);
             if (err == ESP_OK) {
-                ESP_LOGI(TAG, "Server status sent: HTTP %d", esp_http_client_get_status_code(client));
+                if (status == 200) {
+                    ESP_LOGI(TAG, "Server status sent: HTTP 200");
+                } else {
+                    ESP_LOGW(TAG, "Server status sent: HTTP %d, resp: %s", status, status_resp);
+                }
             } else {
                 ESP_LOGW(TAG, "Server status failed: %s", esp_err_to_name(err));
             }
@@ -844,7 +878,7 @@ static void server_sync_task(void *pvParameters)
 
         esp_http_client_config_t get_cfg = {
             .url = url,
-            .timeout_ms = 3000,
+            .timeout_ms = 4000,
             .event_handler = http_event_handler,
             .user_data = resp_buf,
             .crt_bundle_attach = esp_crt_bundle_attach,
@@ -854,24 +888,40 @@ static void server_sync_task(void *pvParameters)
             if (esp_http_client_perform(client) == ESP_OK && (resp_len > 0 || strlen(resp_buf) > 0)) {
                 int val = 0;
                 char *p;
-                if ((p = strstr(resp_buf, "\"fan\":")) && sscanf(p, "\"fan\":%d", &val) == 1) {
-                    g_fan_on = (val != 0);
-                }
-                if ((p = strstr(resp_buf, "\"door\":")) && sscanf(p, "\"door\":%d", &val) == 1) {
-                    if (val == 0) {
-                        g_door_unlocked = false;
-                        g_door_unlock_until = 0;
-                    } else {
-                        g_door_unlocked = true;
-                        g_door_unlock_until = esp_timer_get_time() + 30000000ULL;
+                if ((p = strstr(resp_buf, "\"lamp\":")) && sscanf(p, "\"lamp\":%d", &val) == 1) {
+                    bool new_lamp = (val != 0);
+                    if (new_lamp != g_lamp_on) {
+                        g_lamp_on = new_lamp;
+                        ESP_LOGI(TAG, "Lamp command: %s (Relay 1 - GPIO 47 / LE1)", g_lamp_on ? "ON" : "OFF");
                     }
                 }
-                if ((p = strstr(resp_buf, "\"lamp\":")) && sscanf(p, "\"lamp\":%d", &val) == 1) {
-                    g_lamp_on = (val != 0);
+                if ((p = strstr(resp_buf, "\"door\":")) && sscanf(p, "\"door\":%d", &val) == 1) {
+                    if (val == 1) {
+                        g_door_unlocked = true;
+                        g_door_unlock_until = esp_timer_get_time() + 20000000ULL; // Tự động khóa sau đúng 20 giây
+                        apply_relay_outputs();
+                        ESP_LOGI(TAG, "Door command: UNLOCKED for 20s (Relay 2 - GPIO 21 / LE2)");
+                    } else if (val == 0 && g_door_unlocked) {
+                        g_door_unlocked = false;
+                        g_door_unlock_until = 0;
+                        apply_relay_outputs();
+                        ESP_LOGI(TAG, "Door command: LOCKED (Relay 2 - GPIO 21 / LE2)");
+                    }
+                }
+                if ((p = strstr(resp_buf, "\"fan\":")) && sscanf(p, "\"fan\":%d", &val) == 1) {
+                    bool new_fan = (val != 0);
+                    if (new_fan != g_fan_on) {
+                        g_fan_on = new_fan;
+                        ESP_LOGI(TAG, "Fan command: %s (Relay 3 - GPIO 20 / LE3)", g_fan_on ? "ON" : "OFF");
+                    }
                 }
                 if ((p = strstr(resp_buf, "\"buzzer\":")) && sscanf(p, "\"buzzer\":%d", &val) == 1) {
-                    g_buzzer_on = (val != 0);
-                    g_buzzer_manual_override = true;
+                    bool new_buzzer = (val != 0);
+                    if (new_buzzer != g_buzzer_on) {
+                        g_buzzer_on = new_buzzer;
+                        g_buzzer_manual_override = true;
+                        ESP_LOGI(TAG, "Buzzer command: %s (GPIO 48 / Onboard LED)", g_buzzer_on ? "ON" : "OFF");
+                    }
                 }
                 if ((p = strstr(resp_buf, "\"rfid_enroll\":")) && sscanf(p, "\"rfid_enroll\":%d", &val) == 1) {
                     g_rfid_enroll_mode = (val != 0);
@@ -893,42 +943,61 @@ static void camera_stream_task(void *pvParameters)
 {
     ESP_LOGI(TAG, "Camera real-time stream task started");
     char url[192];
+    esp_http_client_handle_t client = NULL;
+    bool first_ok = true;
 
     while (true) {
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_LOGW(TAG, "esp_camera_fb_get failed (camera init error?)");
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        snprintf(url, sizeof(url), "%s/api/device/camera/upload", g_server_url);
-
-        esp_http_client_config_t cfg = {
-            .url = url,
-            .method = HTTP_METHOD_POST,
-            .timeout_ms = 3000,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .keep_alive_enable = true,
-        };
-
-        esp_http_client_handle_t client = esp_http_client_init(&cfg);
-        if (client != NULL) {
-            esp_http_client_set_header(client, "Content-Type", "image/jpeg");
-            esp_http_client_set_header(client, "X-Device-Id", "esp32s3cam");
-            esp_http_client_set_post_field(client, (const char *)fb->buf, fb->len);
-            esp_err_t err = esp_http_client_perform(client);
-            if (err != ESP_OK) {
-                ESP_LOGD(TAG, "Camera frame upload: %s", esp_err_to_name(err));
+        if (client == NULL) {
+            snprintf(url, sizeof(url), "%s/api/device/camera/upload", g_server_url);
+            esp_http_client_config_t cfg = {
+                .url = url,
+                .method = HTTP_METHOD_POST,
+                .timeout_ms = 4000,
+                .crt_bundle_attach = esp_crt_bundle_attach,
+                .keep_alive_enable = true,
+            };
+            client = esp_http_client_init(&cfg);
+            if (!client) {
+                ESP_LOGE(TAG, "Failed to initialize HTTP client for camera upload");
+                esp_camera_fb_return(fb);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
             }
+        }
+
+        esp_http_client_set_header(client, "Content-Type", "image/jpeg");
+        esp_http_client_set_header(client, "X-Device-Id", "esp32s3cam");
+        esp_http_client_set_post_field(client, (const char *)fb->buf, fb->len);
+
+        esp_err_t err = esp_http_client_perform(client);
+        int status = esp_http_client_get_status_code(client);
+
+        if (err != ESP_OK || status != 200) {
+            ESP_LOGW(TAG, "Upload fail: %s, HTTP %d, len=%u, free heap: int=%u, spiram=%u",
+                     esp_err_to_name(err), status, (unsigned)fb->len,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
             esp_http_client_cleanup(client);
+            client = NULL;
+            first_ok = true;
+        } else if (first_ok) {
+            ESP_LOGI(TAG, "Camera upload OK (%u bytes)", (unsigned)fb->len);
+            first_ok = false;
         }
 
         esp_camera_fb_return(fb);
 
-        // Khoảng nghỉ giữa các frame (~10-12 FPS)
-        vTaskDelay(pdMS_TO_TICKS(80));
+        // Khoảng nghỉ giữa các frame (~10 FPS)
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
